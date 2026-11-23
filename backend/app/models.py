@@ -336,6 +336,50 @@ class DataDriftRecord:
     kl_divergence: str
     drift_direction: str
     detected_at: str
+    report_code: str = ""
+    order_day: str = ""
+    handle_status: str = "已检测"
+    handling_result: str = ""
+    confirmable_difference: float | None = None
+
+
+@dataclass
+class WideTableVersion:
+    """宽表版本提交：同一订单日一批宽表明细的版本凭据。"""
+    version_id: int
+    wide_table: str
+    order_day: str
+    version_no: int
+    amount: float
+    detail: dict[str, Any] = field(default_factory=dict)
+    submit_status: str = "提交中"
+    submitted_at: str = ""
+
+
+@dataclass
+class ComparisonReport:
+    """比较报告：一轮对账实际比较过的两端版本凭据与差异明细。
+
+    凭据持久保存后，刷新、重试与新批次比较都不会改写本轮结果，
+    漂移处置与差异复算只读本报告。
+    """
+    report_id: int
+    report_code: str
+    plan_id: int
+    plan_code: str
+    order_day: str
+    round_no: int
+    primary_table: str
+    reference_table: str
+    primary_version: int = 0
+    reference_version: int = 0
+    primary_amount: float | None = None
+    reference_amount: float | None = None
+    difference: float | None = None
+    detail_snapshot: dict[str, Any] = field(default_factory=dict)
+    pair_reason: str = ""
+    report_status: str = "待配对"
+    compared_at: str = ""
 
 
 @dataclass

@@ -13,6 +13,7 @@ from typing import Any
 from app.models import (
     BackfillTask,
     ColdStoreStrategy,
+    ComparisonReport,
     CrossValidatePlan,
     DataDriftRecord,
     ExportPlan,
@@ -28,6 +29,7 @@ from app.models import (
     SourceDef,
     WatermarkRecord,
     WideTableDef,
+    WideTableVersion,
 )
 
 
@@ -60,6 +62,8 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        self._versions: dict[int, WideTableVersion] = {}
+        self._reports: dict[int, ComparisonReport] = {}
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -369,6 +373,369 @@ class FusionEngine:
         )
         self._monitors[sid] = metric
         return metric
+
+    # ---- 9. 版本化交叉校验对账：版本凭据、比较报告与漂移处置 ----
+
+    def submit_wide_table_version(self, wide_table: str, order_day: str,
+                                  amount: float, detail: dict[str, Any] | None = None,
+                                  confirmed: bool = False) -> WideTableVersion:
+        """提交同一订单日的一批宽表明细，生成版本凭据（默认提交中）。"""
+        sid = self._next_seq()
+        version_no = max(
+            (v.version_no for v in self._versions.values()
+             if v.wide_table == wide_table and v.order_day == order_day),
+            default=0,
+        ) + 1
+        version = WideTableVersion(
+            version_id=sid,
+            wide_table=wide_table,
+            order_day=order_day,
+            version_no=version_no,
+            amount=float(amount),
+            detail=detail or {},
+            submit_status="已确认" if confirmed else "提交中",
+            submitted_at=_now_iso(),
+        )
+        self._versions[sid] = version
+        return version
+
+    def confirm_wide_table_version(self, version_id: int) -> WideTableVersion | None:
+        """确认宽表版本：提交中的批次变为可参与对账的已确认凭据。"""
+        version = self._versions.get(version_id)
+        if version is None:
+            return None
+        version.submit_status = "已确认"
+        return version
+
+    def request_comparison(self, plan_id: int, order_day: str) -> dict[str, Any]:
+        """值班请求比较：按订单日配对两侧同批次版本，生成或刷新对账报告。
+
+        一轮对账只比较同版本号且均已确认的两张宽表明细；任一侧新版本
+        仍在提交即版本冲突，报告保持待配对并注明原因。刷新与重试只作用
+        于同一轮报告，不会把不同批次的订单当成同一轮对账。
+        """
+        plan = self._cross_validates.get(plan_id)
+        if plan is None:
+            return {"ok": False, "message": f"交叉校验方案 {plan_id} 不存在"}
+
+        primary_latest = self._latest_version_no(plan.primary_wide_table, order_day)
+        reference_latest = self._latest_version_no(plan.reference_wide_table, order_day)
+        round_no = min(primary_latest, reference_latest)
+        if round_no == 0:
+            return {"ok": False,
+                    "message": f"订单日 {order_day} 两侧尚未提交可配对的批次"}
+
+        report = self._find_report(plan.plan_id, order_day, round_no)
+        if report is not None and report.report_status in ("已确认", "已办结"):
+            # 同一轮的刷新/重试：凭据已持久保存，直接复用，不重算不覆盖
+            result: dict[str, Any] = {
+                "ok": True,
+                "paired": True,
+                "refreshed": True,
+                "report": self._report_view(report),
+                "message": f"第 {round_no} 轮对账报告 {report.report_code} "
+                           f"已{report.report_status}，刷新不重算",
+            }
+            if max(primary_latest, reference_latest) > round_no:
+                result["message"] += "；存在更新的批次等待两侧到齐后开启新一轮"
+            return result
+
+        primary_version = self._version_of(plan.primary_wide_table, order_day, round_no)
+        reference_version = self._version_of(plan.reference_wide_table, order_day, round_no)
+        blocking = self._pair_blocking(plan, round_no, primary_version, reference_version)
+
+        if report is None:
+            sid = self._next_seq()
+            report = ComparisonReport(
+                report_id=sid,
+                report_code=_generate_code("CMPR", sid),
+                plan_id=plan.plan_id,
+                plan_code=plan.plan_code,
+                order_day=order_day,
+                round_no=round_no,
+                primary_table=plan.primary_wide_table,
+                reference_table=plan.reference_wide_table,
+            )
+            self._reports[sid] = report
+
+        if blocking:
+            report.report_status = "待配对"
+            report.pair_reason = "；".join(blocking)
+            plan.validate_status = "校验中"
+            return {
+                "ok": True,
+                "paired": False,
+                "refreshed": False,
+                "report": self._report_view(report),
+                "reason": f"第 {round_no} 轮比较待配对：{report.pair_reason}",
+            }
+
+        # 两侧同批次版本均已确认：配对比较并把版本凭据持久保存到报告
+        if primary_version is None or reference_version is None:
+            return {"ok": False, "message": f"第 {round_no} 轮版本凭据缺失，无法比较"}
+        difference = round(primary_version.amount - reference_version.amount, 6)
+        report.primary_version = primary_version.version_no
+        report.reference_version = reference_version.version_no
+        report.primary_amount = primary_version.amount
+        report.reference_amount = reference_version.amount
+        report.difference = difference
+        report.detail_snapshot = {
+            "primary": dict(primary_version.detail),
+            "reference": dict(reference_version.detail),
+        }
+        report.pair_reason = ""
+        report.report_status = "已确认"
+        report.compared_at = _now_iso()
+
+        plan.validate_status = "偏差告警" if difference != 0 else "一致"
+        plan.last_result = json.dumps({
+            "report_code": report.report_code,
+            "order_day": order_day,
+            "round_no": round_no,
+            "primary_version": report.primary_version,
+            "reference_version": report.reference_version,
+            "difference": difference,
+            "drift_detected": difference != 0,
+        }, ensure_ascii=False)
+
+        drift_code = ""
+        if difference != 0:
+            drift = self._drift_for_report(report.report_code)
+            if drift is None:
+                drift = self.create_drift_record(
+                    wide_table_name=plan.primary_wide_table,
+                    drift_type="cross_validate_mismatch",
+                    historical_baseline=(
+                        f"参照宽表 {plan.reference_wide_table} "
+                        f"v{reference_version.version_no} 金额 {reference_version.amount}"),
+                    current_distribution=(
+                        f"主体宽表 {plan.primary_wide_table} "
+                        f"v{primary_version.version_no} 金额 {primary_version.amount}"),
+                    drift_direction="up" if difference > 0 else "down",
+                )
+                drift.report_code = report.report_code
+                drift.order_day = order_day
+                drift.confirmable_difference = difference
+            drift_code = drift.record_code
+
+        return {
+            "ok": True,
+            "paired": True,
+            "refreshed": False,
+            "report": self._report_view(report),
+            "drift_record_code": drift_code,
+        }
+
+    def claim_drift(self, plan_id: int, order_day: str) -> dict[str, Any]:
+        """值班认领本次请求可用的漂移。
+
+        优先领取同一订单日尚未办结的旧报告，按报告持久保存的凭据差额
+        处理并留存其报告号；当前轮比较仍待配对时，在结果里说明本次
+        领不到差异的原因。
+        """
+        plan = self._cross_validates.get(plan_id)
+        if plan is None:
+            return {"ok": False, "message": f"交叉校验方案 {plan_id} 不存在"}
+
+        current = self._latest_report(plan.plan_id, order_day)
+        current_round: dict[str, Any] = {}
+        if current is not None:
+            current_round = {
+                "report_code": current.report_code,
+                "round_no": current.round_no,
+                "report_status": current.report_status,
+                "reason": current.pair_reason,
+            }
+
+        # 同一订单日尚未办结、已确认且有差异的旧报告，按轮次先到先得
+        for report in self._reports_for(plan.plan_id, order_day):
+            if report.report_status != "已确认" or not report.difference:
+                continue
+            drift = self._drift_for_report(report.report_code)
+            if drift is None:
+                continue
+            if drift.handle_status == "已检测":
+                drift.handle_status = "评估中"
+                message = f"已领取报告 {report.report_code} 的漂移，差额 {report.difference}"
+            else:
+                message = f"报告 {report.report_code} 的漂移复核中，继续按差额 {report.difference} 处理"
+            return {
+                "ok": True,
+                "report_code": report.report_code,
+                "difference": report.difference,
+                "drift_record_id": drift.record_id,
+                "drift_record_code": drift.record_code,
+                "handle_status": drift.handle_status,
+                "current_round": current_round,
+                "message": message,
+            }
+
+        if current is not None and current.report_status == "待配对":
+            reason = (f"第 {current.round_no} 轮比较仍待配对"
+                      + (f"（{current.pair_reason}）" if current.pair_reason else ""))
+        elif current is not None:
+            reason = f"第 {current.round_no} 轮对账无差异或已办结"
+        else:
+            reason = "尚未发起比较"
+        return {
+            "ok": False,
+            "message": f"本次请求领不到差异：{reason}",
+            "current_round": current_round,
+        }
+
+    def confirm_drift(self, record_id: int) -> dict[str, Any]:
+        """确认漂移（原有动作）：读比较版本凭据，把实际核过的版本对与差值留在处置结果里。
+
+        处置结果只取自漂移记录指向的比较报告；报告凭据已持久保存，
+        新比较不会覆盖旧处置，重复确认结果不变。
+        """
+        record = self._drifts.get(record_id)
+        if record is None:
+            return {"ok": False, "message": f"漂移记录 {record_id} 不存在"}
+        if record.handle_status == "已确认" and record.handling_result:
+            return {
+                "ok": True,
+                "drift_record_id": record.record_id,
+                "drift_record_code": record.record_code,
+                "handle_status": record.handle_status,
+                "handling_result": json.loads(record.handling_result),
+                "message": "漂移已确认，处置结果以原报告凭据为准，不被新比较覆盖",
+            }
+        report = self._find_report_by_code(record.report_code) if record.report_code else None
+        if report is None or report.difference is None:
+            return {"ok": False,
+                    "message": "漂移记录缺少比较版本凭据，无法确认差异"}
+
+        difference = round((report.primary_amount or 0.0) - (report.reference_amount or 0.0), 6)
+        handling = {
+            "report_code": report.report_code,
+            "order_day": report.order_day,
+            "round_no": report.round_no,
+            "primary_table": report.primary_table,
+            "reference_table": report.reference_table,
+            "primary_version": report.primary_version,
+            "reference_version": report.reference_version,
+            "primary_amount": report.primary_amount,
+            "reference_amount": report.reference_amount,
+            "difference": difference,
+            "confirmed_at": _now_iso(),
+        }
+        record.handling_result = json.dumps(handling, ensure_ascii=False)
+        record.confirmable_difference = difference
+        record.handle_status = "已确认"
+        record.drift_direction = "up" if difference > 0 else "down" if difference < 0 else "none"
+        report.report_status = "已办结"
+        return {
+            "ok": True,
+            "drift_record_id": record.record_id,
+            "drift_record_code": record.record_code,
+            "handle_status": record.handle_status,
+            "handling_result": handling,
+            "message": f"漂移已确认：报告 {report.report_code} "
+                       f"v{report.primary_version} 对 v{report.reference_version}，差值 {difference}",
+        }
+
+    def get_comparison_report(self, report_code: str) -> dict[str, Any] | None:
+        """回查比较报告：读取持久保存的版本凭据与差异明细。"""
+        report = self._find_report_by_code(report_code)
+        return self._report_view(report) if report is not None else None
+
+    def list_comparison_reports(self, plan_id: int, order_day: str) -> list[dict[str, Any]]:
+        """列出同一订单日的全部对账报告（按轮次排序）。"""
+        return [self._report_view(r) for r in self._reports_for(plan_id, order_day)]
+
+    def get_drift_record(self, record_id: int) -> DataDriftRecord | None:
+        return self._drifts.get(record_id)
+
+    def recompute_report_difference(self, report_code: str) -> float | None:
+        """复算原来的漂移差异：只读报告持久保存的版本凭据，不看新批次。"""
+        report = self._find_report_by_code(report_code)
+        if report is None or report.primary_amount is None or report.reference_amount is None:
+            return None
+        return round(report.primary_amount - report.reference_amount, 6)
+
+    def _version_of(self, wide_table: str, order_day: str,
+                    version_no: int) -> WideTableVersion | None:
+        for version in self._versions.values():
+            if (version.wide_table == wide_table and version.order_day == order_day
+                    and version.version_no == version_no):
+                return version
+        return None
+
+    def _latest_version_no(self, wide_table: str, order_day: str) -> int:
+        return max(
+            (v.version_no for v in self._versions.values()
+             if v.wide_table == wide_table and v.order_day == order_day),
+            default=0,
+        )
+
+    @staticmethod
+    def _pair_blocking(plan: CrossValidatePlan, round_no: int,
+                       primary_version: WideTableVersion | None,
+                       reference_version: WideTableVersion | None) -> list[str]:
+        """列出第 round_no 轮还不能配对的原因（版本冲突明细）。"""
+        blocking: list[str] = []
+        for label, table, version in (
+            ("主体", plan.primary_wide_table, primary_version),
+            ("参照", plan.reference_wide_table, reference_version),
+        ):
+            if version is None:
+                blocking.append(f"{label}宽表 {table} v{round_no} 尚未提交")
+            elif version.submit_status != "已确认":
+                blocking.append(f"{label}宽表 {table} v{round_no} 仍在提交（版本冲突）")
+        return blocking
+
+    def _find_report(self, plan_id: int, order_day: str,
+                     round_no: int) -> ComparisonReport | None:
+        for report in self._reports.values():
+            if (report.plan_id == plan_id and report.order_day == order_day
+                    and report.round_no == round_no):
+                return report
+        return None
+
+    def _find_report_by_code(self, report_code: str) -> ComparisonReport | None:
+        for report in self._reports.values():
+            if report.report_code == report_code:
+                return report
+        return None
+
+    def _reports_for(self, plan_id: int, order_day: str) -> list[ComparisonReport]:
+        return sorted(
+            (r for r in self._reports.values()
+             if r.plan_id == plan_id and r.order_day == order_day),
+            key=lambda r: r.round_no,
+        )
+
+    def _latest_report(self, plan_id: int, order_day: str) -> ComparisonReport | None:
+        reports = self._reports_for(plan_id, order_day)
+        return reports[-1] if reports else None
+
+    def _drift_for_report(self, report_code: str) -> DataDriftRecord | None:
+        for drift in self._drifts.values():
+            if drift.report_code == report_code:
+                return drift
+        return None
+
+    @staticmethod
+    def _report_view(report: ComparisonReport) -> dict[str, Any]:
+        """报告视图：注明实际比较过的两端与持久保存的版本凭据。"""
+        return {
+            "report_code": report.report_code,
+            "plan_code": report.plan_code,
+            "order_day": report.order_day,
+            "round_no": report.round_no,
+            "primary_table": report.primary_table,
+            "reference_table": report.reference_table,
+            "primary_version": report.primary_version,
+            "reference_version": report.reference_version,
+            "primary_amount": report.primary_amount,
+            "reference_amount": report.reference_amount,
+            "difference": report.difference,
+            "detail_snapshot": report.detail_snapshot,
+            "pair_reason": report.pair_reason,
+            "report_status": report.report_status,
+            "compared_at": report.compared_at,
+        }
 
     # ---- 复合融合操作 ----
 
@@ -874,6 +1241,8 @@ class FusionEngine:
             "cross_validates": len(self._cross_validates),
             "drifts": len(self._drifts),
             "monitors": len(self._monitors),
+            "wide_table_versions": len(self._versions),
+            "comparison_reports": len(self._reports),
         }
 
 
